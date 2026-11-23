@@ -1,5 +1,6 @@
 from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from backend.src.api.routes import router
 from backend.src.database import init_db
 
@@ -60,20 +61,80 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Configure CORS
-origins = [
-    "http://localhost",
-    "http://localhost:3000", # Frontend
-    "http://localhost:8000", # Backend
-]
+# -----------------------------------------------------------------------------
+# Access control
+#
+# The API has no login and serves health data, so it must not be callable by
+# arbitrary web pages the user happens to have open. Three layers:
+#   1. TrustedHostMiddleware rejects requests whose Host header is not ours,
+#      which defeats DNS-rebinding attacks against localhost.
+#   2. origin_guard rejects any request that carries a foreign Origin header.
+#      Browsers attach Origin to every cross-site POST and every cross-origin
+#      fetch, so this blocks both data reads and CSRF-style writes.
+#   3. The packaged Electron app loads from file:// (Origin "null"/"file://"),
+#      which a sandboxed iframe on any site can also send. Electron therefore
+#      passes a random per-launch token (CRACKED_OURA_API_TOKEN) that its main
+#      process attaches to every request; "null" origins are only accepted
+#      together with that token.
+# -----------------------------------------------------------------------------
+from fastapi.responses import JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+import hmac
 
+
+def _env_list(name: str, default: str) -> list:
+    return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
+
+
+ALLOWED_ORIGINS = _env_list(
+    "CRACKED_OURA_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173",  # Vite dev server
+)
+ALLOWED_HOSTS = _env_list("CRACKED_OURA_ALLOWED_HOSTS", "localhost,127.0.0.1")
+API_TOKEN = os.getenv("CRACKED_OURA_API_TOKEN", "")
+TOKEN_HEADER = "x-cracked-oura-token"
+_OPAQUE_ORIGINS = {"null", "file://"}
+
+
+def _has_valid_token(request: Request) -> bool:
+    supplied = request.headers.get(TOKEN_HEADER, "")
+    return bool(API_TOKEN) and hmac.compare_digest(supplied, API_TOKEN)
+
+
+def _is_same_origin(request: Request, origin: str) -> bool:
+    host = request.headers.get("host", "")
+    return origin in (f"http://{host}", f"https://{host}")
+
+
+@app.middleware("http")
+async def origin_guard(request: Request, call_next):
+    # Preflights carry no data and are answered by CORSMiddleware.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    origin = request.headers.get("origin")
+    allowed = (
+        origin is None                       # same-origin GET, curl, healthcheck
+        or origin in ALLOWED_ORIGINS
+        or _is_same_origin(request, origin)  # Docker/web UI served by this app
+        or (origin in _OPAQUE_ORIGINS and _has_valid_token(request))  # Electron
+    )
+    if not allowed:
+        logger.warning(f"Blocked request from origin {origin!r} to {request.url.path}")
+        return JSONResponse({"detail": "Origin not allowed"}, status_code=403)
+    return await call_next(request)
+
+
+# Opaque origins are listed for CORS only when a token is configured; the
+# guard above still requires the token on every actual request from them.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS + (sorted(_OPAQUE_ORIGINS) if API_TOKEN else []),
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 # Include routers
 app.include_router(router)
@@ -115,7 +176,7 @@ async def submit_otp(request: OTPRequest, background_tasks: BackgroundTasks):
     """
     Submits OTP code to the running automation session.
     """
-    logger.info(f"Received OTP: {request.otp}, Action: {request.action}")
+    logger.info(f"Received OTP submission. Action: {request.action}")
     config_manager.update_status("Submitting OTP...")
     
     try:
@@ -316,7 +377,8 @@ async def process_ingestion(zip_path):
     db = SessionLocal()
     try:
         parser = OuraParser(db)
-        parser.parse_zip(zip_path)
+        # Parsing is CPU/disk bound; keep it off the event loop.
+        await run_in_threadpool(parser.parse_zip, zip_path)
         logger.info("Background worker: Ingestion successful.")
         
         # Success!
@@ -373,15 +435,15 @@ async def background_worker():
 from fastapi.staticfiles import StaticFiles
 import os
 
-# Robustly find the frontend/dist directory relative to this file
-# engine/src/api/main.py -> ../../../frontend/dist
+# Robustly find the frontend/dist directory (env override or relative path)
 current_dir = os.path.dirname(os.path.abspath(__file__))
-dist_dir = os.path.join(current_dir, "../../../frontend/dist")
+dist_dir = os.getenv("FRONTEND_DIST_DIR") or os.path.join(current_dir, "../../../frontend/dist")
 
 if os.path.exists(dist_dir):
+    logger.info(f"Mounting frontend static files from {dist_dir}")
     app.mount("/", StaticFiles(directory=dist_dir, html=True), name="static")
 else:
-    pass
+    logger.warning(f"Frontend dist directory not found at {dist_dir}; API-only mode.")
 
 
 if __name__ == "__main__":
@@ -410,4 +472,5 @@ if __name__ == "__main__":
     else:
         # Development
         # Run the server with auto-reload
-        uvicorn.run("backend.src.api.main:app", host="0.0.0.0", port=8000, reload=True, reload_dirs=["backend"])
+        # Bind to loopback only: the API has no authentication.
+        uvicorn.run("backend.src.api.main:app", host="127.0.0.1", port=8000, reload=True, reload_dirs=["backend"])

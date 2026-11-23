@@ -27,18 +27,31 @@ try:
     os.remove(test_file)
 
 except Exception as e:
-    # CRITICAL: Write crash report to Documents
+    # CRITICAL: Write crash report to Documents when writable, fallback to stderr
     crash_file = os.path.expanduser("~/Documents/cracked_oura_backend_crash.txt")
-    with open(crash_file, "w", encoding="utf-8") as f:
-        f.write(f"Database Config CRASH: {e}\n")
-        f.write(traceback.format_exc())
+    try:
+        os.makedirs(os.path.dirname(crash_file), exist_ok=True)
+        with open(crash_file, "w", encoding="utf-8") as f:
+            f.write(f"Database Config CRASH: {e}\n")
+            f.write(traceback.format_exc())
+    except Exception as write_err:
+        print(f"Database Config CRASH: {e}\n{traceback.format_exc()}", file=sys.stderr)
+        print(f"Additionally failed to write crash file {crash_file}: {write_err}", file=sys.stderr)
     sys.exit(1)
 
 # --- SQLAlchemy Setup ---
 
 # Create the SQLAlchemy engine
 # echo=False disables raw SQL logging to keep console output clean
-engine = create_engine(DATABASE_URL, echo=False)
+# check_same_thread=False: sessions are created and used across FastAPI's
+# threadpool workers (sync endpoints, run_in_threadpool), which pysqlite
+# would otherwise reject. SQLAlchemy's pool still hands each connection to
+# one thread at a time.
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    connect_args={"check_same_thread": False},
+)
 
 # Session factory for creating new database sessions
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

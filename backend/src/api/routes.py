@@ -1,4 +1,5 @@
 
+import asyncio
 import logging
 import os
 import shutil
@@ -9,6 +10,7 @@ from typing import List, Optional, Any
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, BackgroundTasks
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
@@ -35,6 +37,9 @@ logger = logging.getLogger("API")
 
 # Router Initialization
 router = APIRouter()
+
+# Event used to resume a background sync that paused waiting for OTP
+_otp_event: Optional[asyncio.Event] = None
 
 # -----------------------------------------------------------------------------
 # Data Models and request/response schemas
@@ -77,39 +82,47 @@ async def run_full_sync_task(db_session_factory):
     """
     Executes the full synchronization process:
     1. Request export from Oura Cloud (via playwright).
-    2. Wait for export generation.
+    2. Wait for export generation (pausing for OTP if required).
     3. Download the export zip.
     4. Ingest data into the local SQLite database.
     """
+    global _otp_event
     config_manager.update_status("Processing", message="Starting full sync...")
     try:
-        # Create temp dir for the download
         with tempfile.TemporaryDirectory() as temp_dir:
             config_manager.update_status("Processing", message="Requesting and waiting for export (this may take hours)...")
-            
-            # This step blocks while waiting for Oura to generate the export
+
             result = await automator.request_new_export_and_download(temp_dir)
-            
-            # Handle OTP requirement
+
+            # OTP required — pause and wait for the user to submit it
             if isinstance(result, dict) and result.get("status") == "otp_required":
-                config_manager.update_status("Error", message="OTP required. Please login manually in settings.")
-                logger.warning("Full sync failed: OTP required.")
-                return
+                logger.warning("Full sync paused: OTP required.")
+                _otp_event = asyncio.Event()
+                config_manager.update_status("otp_required", message="Check your email for the OTP code and enter it below.")
+                try:
+                    await asyncio.wait_for(_otp_event.wait(), timeout=300)
+                except asyncio.TimeoutError:
+                    logger.warning("OTP entry timed out.")
+                    config_manager.update_status("Error", message="OTP entry timed out. Please try syncing again.")
+                    return
+                finally:
+                    _otp_event = None
+
+                # OTP submitted — retry the export flow
+                config_manager.update_status("Processing", message="OTP accepted. Resuming sync...")
+                result = await automator.request_new_export_and_download(temp_dir)
 
             zip_path = result
-            
-            # Process successfully downloaded file
+
             if zip_path and isinstance(zip_path, str):
-                config_manager.update_status("Processing", message=f"Downloaded to {zip_path}. Ingesting...")
+                config_manager.update_status("Processing", message="Download complete. Ingesting data...")
                 logger.info(f"Full sync: Downloaded to {zip_path}. Ingesting...")
-                
-                # Ingest into Database
+
                 db = db_session_factory()
                 try:
                     parser = OuraParser(db)
-                    parser.parse_zip(zip_path)
+                    await run_in_threadpool(parser.parse_zip, zip_path)
                     logger.info("Full sync: Ingestion complete.")
-                    
                     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     config_manager.update_status("Idle", message="Sync and ingestion complete!", last_run=now_str)
                 finally:
@@ -117,7 +130,7 @@ async def run_full_sync_task(db_session_factory):
             else:
                 logger.error("Full sync failed: No file downloaded.")
                 config_manager.update_status("Error", message="No file downloaded (timeout?)")
-                
+
     except Exception as e:
         logger.error(f"Full sync task error: {e}")
         config_manager.update_status("Error", message=f"Sync failed: {e}")
@@ -129,9 +142,13 @@ async def run_full_sync_task(db_session_factory):
 # -----------------------------------------------------------------------------
 
 @router.post("/api/advisor/chat")
-async def chat(request: ChatRequest):
+def chat(request: ChatRequest):
     """
     Interacts with the AI Advisor (LangChain SQL Agent).
+
+    Declared as a plain ``def`` on purpose: the agent call is synchronous and
+    can run for minutes, so FastAPI must execute it in its threadpool instead
+    of blocking the event loop (which would freeze status polling and OTP).
     """
     try:
         logger.info(f"Incoming Chat Request.")
@@ -162,8 +179,12 @@ async def start_login(request: LoginRequest):
 @router.post("/api/automation/submit-otp")
 async def submit_otp(request: OTPRequest):
     """Submits the OTP code to the active Playwright session."""
+    global _otp_event
     try:
         result = await automator.submit_otp(request.otp)
+        # If a background sync is waiting for OTP, unblock it
+        if _otp_event and not _otp_event.is_set():
+            _otp_event.set()
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -195,15 +216,24 @@ async def download_export(db: Session = Depends(get_db)):
         with tempfile.TemporaryDirectory() as temp_dir:
             zip_path = await automator.download_existing_export(temp_dir)
             
-            if isinstance(zip_path, dict) and zip_path.get("status") == "error":
+            # download_existing_export() returns a status dict instead of a path
+            # when it cannot get to the export page. Passing that dict on to the
+            # parser used to surface as "'dict' object has no attribute 'seek'".
+            if isinstance(zip_path, dict):
+                if zip_path.get("status") == "otp_required":
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Login required: Oura sent a verification code. "
+                               "Submit it before retrying the download.",
+                    )
                 raise HTTPException(status_code=500, detail=f"Download failed: {zip_path.get('message')}")
-            
+
             if not zip_path:
                 raise HTTPException(status_code=500, detail="Download failed: Button not found or timeout.")
 
-            # Ingest
+            # Ingest (off the event loop)
             parser = OuraParser(db)
-            parser.parse_zip(zip_path)
+            await run_in_threadpool(parser.parse_zip, zip_path)
             
             return {"message": "Download and ingestion successful!"}
     except HTTPException as he:
@@ -400,7 +430,9 @@ def query_data(
         if not model:
             raise HTTPException(status_code=400, detail=f"Unknown domain: {domain}")
             
-        if not hasattr(model, field):
+        # Only real table columns are queryable; hasattr() would also accept
+        # arbitrary class attributes such as "metadata" or "registry".
+        if field not in model.__table__.columns.keys():
              raise HTTPException(status_code=400, detail=f"Unknown field: {field} in {domain}")
              
         column = getattr(model, field)
@@ -525,22 +557,26 @@ def get_schema():
 # -----------------------------------------------------------------------------
 
 @router.post("/api/ingest/zip")
-async def ingest_zip(file: UploadFile = File(...), db: Session = Depends(get_db)):
+def ingest_zip(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
     Endpoint for uploading and ingesting an Oura export ZIP file manually.
+
+    Plain ``def`` so the copy and the (slow) parse run in the threadpool.
     """
     parser = OuraParser(db)
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp_file:
             shutil.copyfileobj(file.file, tmp_file)
             tmp_path = tmp_file.name
-            
+
         logger.info(f"Received ZIP file, saved to {tmp_path}")
-        
         parser.parse_zip(tmp_path)
-        os.remove(tmp_path)
-        
         return {"message": "Ingestion successful"}
     except Exception as e:
         logger.error(f"Ingestion error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Always remove the upload, also when parsing fails.
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)

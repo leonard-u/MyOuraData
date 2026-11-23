@@ -5,12 +5,25 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const electron_1 = require("electron");
 const path_1 = __importDefault(require("path"));
+const crypto_1 = __importDefault(require("crypto"));
 const child_process_1 = require("child_process");
-let mainWindow;
+let mainWindow = null;
 let pythonProcess = null;
 let tray = null;
 let isQuitting = false;
 const isDev = process.env.NODE_ENV === 'development';
+// Per-launch secret shared with the backend. The packaged UI loads from
+// file:// (Origin "null"), which any sandboxed iframe on a website can also
+// send, so the backend only trusts such requests when they carry this token.
+// The main process attaches it below; page JavaScript never sees it.
+const API_TOKEN = crypto_1.default.randomBytes(32).toString('hex');
+const BACKEND_URLS = ['http://localhost:8000/*', 'http://127.0.0.1:8000/*'];
+function attachBackendToken() {
+    electron_1.session.defaultSession.webRequest.onBeforeSendHeaders({ urls: BACKEND_URLS }, (details, callback) => {
+        details.requestHeaders['X-Cracked-Oura-Token'] = API_TOKEN;
+        callback({ requestHeaders: details.requestHeaders });
+    });
+}
 function createTray() {
     // We are in shell/electron/main.ts (compiled to dist-electron/main.js)
     // So __dirname is shell/dist-electron
@@ -36,13 +49,7 @@ function createTray() {
         {
             label: 'Open Dashboard',
             click: () => {
-                if (mainWindow) {
-                    mainWindow.show();
-                    mainWindow.focus();
-                }
-                else {
-                    createWindow();
-                }
+                showOrCreateWindow();
             }
         },
         { type: 'separator' },
@@ -56,10 +63,7 @@ function createTray() {
     ]);
     tray.setContextMenu(contextMenu);
     tray.on('double-click', () => {
-        if (mainWindow) {
-            mainWindow.show();
-            mainWindow.focus();
-        }
+        showOrCreateWindow();
     });
 }
 function createWindow() {
@@ -67,8 +71,12 @@ function createWindow() {
         width: 1280,
         height: 800,
         webPreferences: {
-            nodeIntegration: true,
-            contextIsolation: false, // For simple IPC now, can harden later
+            // The renderer is a plain React app and needs no Node.js access.
+            // Keeping it isolated means an XSS bug cannot become code
+            // execution on the user's machine.
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
         },
         backgroundColor: '#0f1115', // Match our dark theme
         show: false, // Don't show until ready
@@ -76,6 +84,20 @@ function createWindow() {
     });
     const devUrl = 'http://localhost:5173';
     const prodPath = path_1.default.join(__dirname, '../dist/index.html');
+    // Never open new Electron windows; send web links to the system browser.
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+        if (url.startsWith('https://') || url.startsWith('http://')) {
+            electron_1.shell.openExternal(url);
+        }
+        return { action: 'deny' };
+    });
+    // Keep the app window on the app itself.
+    mainWindow.webContents.on('will-navigate', (event, url) => {
+        const isAppUrl = isDev ? url.startsWith(devUrl) : url.startsWith('file://');
+        if (!isAppUrl) {
+            event.preventDefault();
+        }
+    });
     if (isDev) {
         logToDesktop(`Loading DEV URL: ${devUrl}`);
         mainWindow.loadURL(devUrl);
@@ -109,6 +131,14 @@ function createWindow() {
     mainWindow.on('closed', () => {
         mainWindow = null;
     });
+}
+function showOrCreateWindow() {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.show();
+        mainWindow.focus();
+        return;
+    }
+    createWindow();
 }
 function getPythonPath() {
     if (!isDev) {
@@ -161,7 +191,8 @@ function startPythonBackend() {
             '--reload'
         ], {
             cwd: path_1.default.join(__dirname, '../../'),
-            stdio: 'inherit'
+            stdio: 'inherit',
+            env: { ...process.env, CRACKED_OURA_API_TOKEN: API_TOKEN }
         });
     }
     else {
@@ -178,7 +209,7 @@ function startPythonBackend() {
             pythonProcess = (0, child_process_1.spawn)(exePath, [], {
                 cwd: path_1.default.dirname(exePath), // Run from its own directory to find dependencies/relative files
                 stdio: ['ignore', 'pipe', 'pipe'], // Capture stdout/stderr
-                env: { ...process.env, PORT: '8000' } // Pass port if needed
+                env: { ...process.env, PORT: '8000', CRACKED_OURA_API_TOKEN: API_TOKEN }
             });
             logToDesktop(`Backend process spawned with PID: ${pythonProcess ? pythonProcess.pid : 'NULL'}`);
         }
@@ -213,6 +244,7 @@ function startPythonBackend() {
     }
 }
 electron_1.app.on('ready', () => {
+    attachBackendToken();
     startPythonBackend();
     createWindow();
     createTray();
@@ -226,12 +258,7 @@ electron_1.app.on('window-all-closed', () => {
     }
 });
 electron_1.app.on('activate', () => {
-    if (mainWindow === null) {
-        createWindow();
-    }
-    else {
-        mainWindow.show();
-    }
+    showOrCreateWindow();
 });
 electron_1.app.on('before-quit', () => {
     isQuitting = true;
