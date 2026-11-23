@@ -119,16 +119,36 @@ class IngestionBase:
 
     # --- Parsing Helpers ---
 
+    @staticmethod
+    def _unescape_csv_quotes(val: str) -> str:
+        """Undo CSV double-quote escaping (""key"" -> "key") and outer quotes."""
+        val = val.replace('""', '"')
+        if len(val) >= 2 and val.startswith('"') and val.endswith('"'):
+            val = val[1:-1]
+        return val
+
+    def _loads_json_lenient(self, val: str):
+        """
+        Parse JSON, trying the raw value first.
+
+        pandas.read_csv already removes CSV quote escaping, so the raw value is
+        normally valid JSON. Un-escaping it again would corrupt empty strings
+        ('{"note":""}' -> '{"note":"}') and silently drop the whole value.
+        The un-escaped variant is only a fallback for values that still carry
+        CSV escaping (e.g. older exports or other readers).
+        Raises json.JSONDecodeError if neither variant parses.
+        """
+        try:
+            return json.loads(val)
+        except json.JSONDecodeError:
+            return json.loads(self._unescape_csv_quotes(val))
+
     def _parse_json_col(self, val):
-        if pd.isna(val) or val == "" or val == 'null':
+        if val is None or (not isinstance(val, (dict, list)) and pd.isna(val)) or val == "" or val == 'null':
             return None
         if isinstance(val, str):
             try:
-                # Handle CSV double-quote escaping
-                val = val.replace('""', '"')
-                if val.startswith('"') and val.endswith('"'):
-                    val = val[1:-1]
-                return json.loads(val)
+                return self._loads_json_lenient(val)
             except json.JSONDecodeError:
                 return None
         return val
@@ -194,20 +214,19 @@ class IngestionBase:
             if not val_str:
                 return None
 
-            # Handle CSV double-quote escaping (e.g. ""key"" -> "key")
-            val_str = val_str.replace('""', '"')
-            if val_str.startswith('"') and val_str.endswith('"'):
-                val_str = val_str[1:-1]
-
-            # 1. JSON parse
+            # 1. JSON parse (raw first, CSV-unescaped as fallback; see
+            #    _loads_json_lenient for why the order matters)
             try:
-                parsed = json.loads(val_str)
+                parsed = self._loads_json_lenient(val_str)
                 if isinstance(parsed, dict) and 'items' in parsed:
                     items = parsed['items']
                 elif isinstance(parsed, list):
                     items = parsed
             except json.JSONDecodeError:
                 pass
+
+            # Later fallbacks work on the CSV-unescaped text.
+            val_str = self._unescape_csv_quotes(val_str)
 
             if items is None:
                 # 2. Fallback: AST literal eval (only if it looks like a list)

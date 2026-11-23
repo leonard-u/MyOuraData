@@ -21,6 +21,14 @@ _EMAIL_CODE_RE = re.compile(
     re.I,
 )
 
+def _mask_email(email: Optional[str]) -> str:
+    """Masks an e-mail address for logging: 'jane.doe@x.com' -> 'ja***@x.com'."""
+    if not email or "@" not in email:
+        return "***"
+    local, domain = email.split("@", 1)
+    return f"{local[:2]}***@{domain}"
+
+
 class OuraAutomator:
     """
     Automates Oura Web Dashboard interactions using Playwright.
@@ -180,6 +188,12 @@ class OuraAutomator:
         """Saves current browser context (cookies/local storage) to disk."""
         if self.context:
             await self.context.storage_state(path=self.storage_state_path)
+            # The storage state holds live Oura session cookies (equivalent to
+            # being logged in), so keep it readable by the owner only.
+            try:
+                os.chmod(self.storage_state_path, 0o600)
+            except OSError as e:
+                logger.warning(f"Could not restrict session file permissions: {e}")
             logger.info(f"Session saved to {self.storage_state_path}")
 
     # --- Login Logic ---
@@ -231,7 +245,7 @@ class OuraAutomator:
              await self.page.goto(f"{self.base_url}/login", timeout=30000)
 
         # Fill Email
-        logger.info(f"Filling email: {self.email}")
+        logger.info(f"Filling email: {_mask_email(self.email)}")
         email_input = self.page.locator("input[name='username']")
         if not await email_input.is_visible():
              email_input = self.page.locator("input[type='email']")
@@ -341,7 +355,7 @@ class OuraAutomator:
         if not self.page:
             return {"status": "error", "message": "Page not initialized"}
 
-        logger.info(f"Submitting OTP: {otp}")
+        logger.info("Submitting OTP.")  # never log the code itself
         try:
             # Locate OTP Input
             otp_selector = "input[name='otp']"

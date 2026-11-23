@@ -1,5 +1,6 @@
-import { app, BrowserWindow, Tray, Menu, nativeImage } from 'electron';
+import { app, BrowserWindow, Tray, Menu, nativeImage, session, shell } from 'electron';
 import path from 'path';
+import crypto from 'crypto';
 import { spawn, ChildProcess } from 'child_process';
 
 let mainWindow: BrowserWindow | null = null;
@@ -8,6 +9,23 @@ let tray: Tray | null = null;
 let isQuitting = false;
 
 const isDev = process.env.NODE_ENV === 'development';
+
+// Per-launch secret shared with the backend. The packaged UI loads from
+// file:// (Origin "null"), which any sandboxed iframe on a website can also
+// send, so the backend only trusts such requests when they carry this token.
+// The main process attaches it below; page JavaScript never sees it.
+const API_TOKEN = crypto.randomBytes(32).toString('hex');
+const BACKEND_URLS = ['http://localhost:8000/*', 'http://127.0.0.1:8000/*'];
+
+function attachBackendToken() {
+    session.defaultSession.webRequest.onBeforeSendHeaders(
+        { urls: BACKEND_URLS },
+        (details, callback) => {
+            details.requestHeaders['X-Cracked-Oura-Token'] = API_TOKEN;
+            callback({ requestHeaders: details.requestHeaders });
+        }
+    );
+}
 
 function createTray() {
     // We are in shell/electron/main.ts (compiled to dist-electron/main.js)
@@ -63,8 +81,12 @@ function createWindow() {
         width: 1280,
         height: 800,
         webPreferences: {
-            nodeIntegration: true,
-            contextIsolation: false, // For simple IPC now, can harden later
+            // The renderer is a plain React app and needs no Node.js access.
+            // Keeping it isolated means an XSS bug cannot become code
+            // execution on the user's machine.
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
         },
         backgroundColor: '#0f1115', // Match our dark theme
         show: false, // Don't show until ready
@@ -73,6 +95,22 @@ function createWindow() {
 
     const devUrl = 'http://localhost:5173';
     const prodPath = path.join(__dirname, '../dist/index.html');
+
+    // Never open new Electron windows; send web links to the system browser.
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+        if (url.startsWith('https://') || url.startsWith('http://')) {
+            shell.openExternal(url);
+        }
+        return { action: 'deny' };
+    });
+
+    // Keep the app window on the app itself.
+    mainWindow.webContents.on('will-navigate', (event, url) => {
+        const isAppUrl = isDev ? url.startsWith(devUrl) : url.startsWith('file://');
+        if (!isAppUrl) {
+            event.preventDefault();
+        }
+    });
 
     if (isDev) {
         logToDesktop(`Loading DEV URL: ${devUrl}`);
@@ -178,7 +216,8 @@ function startPythonBackend() {
             '--reload'
         ], {
             cwd: path.join(__dirname, '../../'),
-            stdio: 'inherit'
+            stdio: 'inherit',
+            env: { ...process.env, CRACKED_OURA_API_TOKEN: API_TOKEN }
         });
     } else {
         logToDesktop("Running in PROD mode");
@@ -195,7 +234,7 @@ function startPythonBackend() {
             pythonProcess = spawn(exePath, [], {
                 cwd: path.dirname(exePath), // Run from its own directory to find dependencies/relative files
                 stdio: ['ignore', 'pipe', 'pipe'], // Capture stdout/stderr
-                env: { ...process.env, PORT: '8000' } // Pass port if needed
+                env: { ...process.env, PORT: '8000', CRACKED_OURA_API_TOKEN: API_TOKEN }
             });
             logToDesktop(`Backend process spawned with PID: ${pythonProcess ? pythonProcess.pid : 'NULL'}`);
         } catch (spawnError: any) {
@@ -233,6 +272,7 @@ function startPythonBackend() {
 }
 
 app.on('ready', () => {
+    attachBackendToken();
     startPythonBackend();
     createWindow();
     createTray();

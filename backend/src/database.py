@@ -43,7 +43,15 @@ except Exception as e:
 
 # Create the SQLAlchemy engine
 # echo=False disables raw SQL logging to keep console output clean
-engine = create_engine(DATABASE_URL, echo=False)
+# check_same_thread=False: sessions are created and used across FastAPI's
+# threadpool workers (sync endpoints, run_in_threadpool), which pysqlite
+# would otherwise reject. SQLAlchemy's pool still hands each connection to
+# one thread at a time.
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    connect_args={"check_same_thread": False},
+)
 
 # Session factory for creating new database sessions
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

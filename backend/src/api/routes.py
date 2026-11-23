@@ -10,6 +10,7 @@ from typing import List, Optional, Any
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, BackgroundTasks
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
@@ -120,7 +121,7 @@ async def run_full_sync_task(db_session_factory):
                 db = db_session_factory()
                 try:
                     parser = OuraParser(db)
-                    parser.parse_zip(zip_path)
+                    await run_in_threadpool(parser.parse_zip, zip_path)
                     logger.info("Full sync: Ingestion complete.")
                     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     config_manager.update_status("Idle", message="Sync and ingestion complete!", last_run=now_str)
@@ -141,9 +142,13 @@ async def run_full_sync_task(db_session_factory):
 # -----------------------------------------------------------------------------
 
 @router.post("/api/advisor/chat")
-async def chat(request: ChatRequest):
+def chat(request: ChatRequest):
     """
     Interacts with the AI Advisor (LangChain SQL Agent).
+
+    Declared as a plain ``def`` on purpose: the agent call is synchronous and
+    can run for minutes, so FastAPI must execute it in its threadpool instead
+    of blocking the event loop (which would freeze status polling and OTP).
     """
     try:
         logger.info(f"Incoming Chat Request.")
@@ -226,9 +231,9 @@ async def download_export(db: Session = Depends(get_db)):
             if not zip_path:
                 raise HTTPException(status_code=500, detail="Download failed: Button not found or timeout.")
 
-            # Ingest
+            # Ingest (off the event loop)
             parser = OuraParser(db)
-            parser.parse_zip(zip_path)
+            await run_in_threadpool(parser.parse_zip, zip_path)
             
             return {"message": "Download and ingestion successful!"}
     except HTTPException as he:
@@ -425,7 +430,9 @@ def query_data(
         if not model:
             raise HTTPException(status_code=400, detail=f"Unknown domain: {domain}")
             
-        if not hasattr(model, field):
+        # Only real table columns are queryable; hasattr() would also accept
+        # arbitrary class attributes such as "metadata" or "registry".
+        if field not in model.__table__.columns.keys():
              raise HTTPException(status_code=400, detail=f"Unknown field: {field} in {domain}")
              
         column = getattr(model, field)
@@ -550,22 +557,26 @@ def get_schema():
 # -----------------------------------------------------------------------------
 
 @router.post("/api/ingest/zip")
-async def ingest_zip(file: UploadFile = File(...), db: Session = Depends(get_db)):
+def ingest_zip(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
     Endpoint for uploading and ingesting an Oura export ZIP file manually.
+
+    Plain ``def`` so the copy and the (slow) parse run in the threadpool.
     """
     parser = OuraParser(db)
+    tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp_file:
             shutil.copyfileobj(file.file, tmp_file)
             tmp_path = tmp_file.name
-            
+
         logger.info(f"Received ZIP file, saved to {tmp_path}")
-        
         parser.parse_zip(tmp_path)
-        os.remove(tmp_path)
-        
         return {"message": "Ingestion successful"}
     except Exception as e:
         logger.error(f"Ingestion error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Always remove the upload, also when parsing fails.
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)

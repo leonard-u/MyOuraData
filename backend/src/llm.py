@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from typing import List, Dict, Any
 from langchain_ollama import ChatOllama
 from langchain_community.utilities import SQLDatabase
@@ -21,8 +22,13 @@ class DataAnalyst:
             callbacks=[StreamingStdOutCallbackHandler()]
         )
         
-        # 2. Initialize Database
-        self.db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
+        # 2. Initialize Database -- READ-ONLY.
+        # The SQL agent executes whatever SQL the model writes. Opening SQLite
+        # with mode=ro makes INSERT/UPDATE/DELETE/DROP fail at the driver level,
+        # so neither a confused model nor a prompt-injected request can modify
+        # or destroy the health data.
+        read_only_uri = f"sqlite:///file:{Path(DB_PATH).as_posix()}?mode=ro&uri=true"
+        self.db = SQLDatabase.from_uri(read_only_uri, sample_rows_in_table_info=2)
 
         # 3. Initialize Tools
         # Safe Subclass to prevent hallucinations
@@ -55,6 +61,23 @@ Observation: result
 Final Answer: answer
 """
 
+    def build_agent(self):
+        """Creates the LangChain SQL agent with bounded work per question."""
+        return create_sql_agent(
+            llm=self.llm,
+            db=self.db,
+            extra_tools=[],
+            agent_type="zero-shot-react-description",
+            verbose=True,
+            prefix=self.system_message,
+            top_k=50,  # cap rows the agent asks for per query
+            # Bound the agent loop so a confused model cannot occupy the
+            # backend indefinitely.
+            max_iterations=8,
+            max_execution_time=120,
+            agent_executor_kwargs={"handle_parsing_errors": True},
+        )
+
     def chat(self, history: List[Dict[str, str]]) -> Dict[str, Any]:
         """
         Invokes the LangChain SQL Agent.
@@ -63,15 +86,7 @@ Final Answer: answer
         thoughts = []
         
         try:
-            agent_executor = create_sql_agent(
-                llm=self.llm,
-                db=self.db,
-                extra_tools=[],
-                agent_type="zero-shot-react-description",
-                verbose=True,
-                prefix=self.system_message,
-                agent_executor_kwargs={"handle_parsing_errors": True}
-            )
+            agent_executor = self.build_agent()
         
             response = agent_executor.invoke(
                 {"input": user_query},

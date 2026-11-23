@@ -7,6 +7,8 @@ main() {
     local pgid="${PGID:-1000}"
 
     mkdir -p "$data_dir"
+    # The data dir holds health data and the Oura session cookie: owner only.
+    chmod 0700 "$data_dir" 2>/dev/null || true
 
     if [[ "$(id -u)" -eq 0 ]]; then
         if [[ "$puid" != "0" || "$pgid" != "0" ]]; then
